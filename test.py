@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from torch.autograd import Variable
 import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
@@ -9,20 +10,20 @@ from torchvision.utils import save_image
 
 import net
 from function import adaptive_instance_normalization, coral
+import numpy as np
 
-
-def test_transform(size, crop):
+def test_transform(size, cropsize, crop):
     transform_list = []
     if size != 0:
         transform_list.append(transforms.Resize(size))
     if crop:
-        transform_list.append(transforms.CenterCrop(size))
+        transform_list.append(transforms.CenterCrop(cropsize))
     transform_list.append(transforms.ToTensor())
     transform = transforms.Compose(transform_list)
     return transform
 
 
-def style_transfer(vgg, decoder, content, style, alpha=1.0,
+def style_transfer(vgg, decoder, content, style, message, alpha=1.0,
                    interpolation_weights=None):
     assert (0.0 <= alpha <= 1.0)
     content_f = vgg(content)
@@ -36,6 +37,7 @@ def style_transfer(vgg, decoder, content, style, alpha=1.0,
         content_f = content_f[0:1]
     else:
         feat = adaptive_instance_normalization(content_f, style_f)
+    feat = feat + message.view(-1, 512, 1, 1)
     feat = feat * alpha + content_f * (1 - alpha)
     return decoder(feat)
 
@@ -53,7 +55,8 @@ parser.add_argument('--style', type=str,
 parser.add_argument('--style_dir', type=str,
                     help='Directory path to a batch of style images')
 parser.add_argument('--vgg', type=str, default='models/vgg_normalised.pth')
-parser.add_argument('--decoder', type=str, default='models/decoder.pth')
+parser.add_argument('--decoder', type=str, default='models/decoder_pretrained.pth')
+parser.add_argument('--extractor', type=str, default='models/extractor.pth')
 
 # Additional options
 parser.add_argument('--content_size', type=int, default=512,
@@ -112,21 +115,29 @@ else:
     style_dir = Path(args.style_dir)
     style_paths = [f for f in style_dir.glob('*')]
 
+extractor = net.extractor
 decoder = net.decoder
 vgg = net.vgg
 
+extractor.eval()
 decoder.eval()
 vgg.eval()
 
+extractor.load_state_dict(torch.load(args.extractor))
+ext1 = nn.Sequential(*list(extractor.children())[:-2])
+ext2 = nn.Sequential(*list(extractor.children())[-2:])
 decoder.load_state_dict(torch.load(args.decoder))
 vgg.load_state_dict(torch.load(args.vgg))
 vgg = nn.Sequential(*list(vgg.children())[:31])
 
+ext1.to(device)
+ext2.to(device)
 vgg.to(device)
 decoder.to(device)
 
-content_tf = test_transform(args.content_size, args.crop)
-style_tf = test_transform(args.style_size, args.crop)
+
+content_tf = test_transform(args.content_size, 256, args.crop)
+style_tf = test_transform(args.style_size, 256, args.crop)
 
 for content_path in content_paths:
     if do_interpolation:  # one content image, N style image
@@ -145,17 +156,54 @@ for content_path in content_paths:
 
     else:  # process one content and one style
         for style_path in style_paths:
+            message = torch.rand(1, 512)
+            print('message\'s shape:{}'.format(message.shape))
+            print('message:{}'.format(message))
+            message1 = np.array(message)
+            np.savetxt('message.txt',message1)
+
             content = content_tf(Image.open(str(content_path)))
             style = style_tf(Image.open(str(style_path)))
             if args.preserve_color:
                 style = coral(style, content)
             style = style.to(device).unsqueeze(0)
             content = content.to(device).unsqueeze(0)
+            message = message.to(device)
             with torch.no_grad():
-                output = style_transfer(vgg, decoder, content, style,
+                output = style_transfer(vgg, decoder, content, style, message,
                                         args.alpha)
+            
+            print(output.shape)
+            # 提取信息
+            message_ext = ext1(output)
+            print('Extracted message\'s shape:{}'.format(message_ext.shape))
+            message_ext = message_ext.view(1,512*16*16)
+            message_ext = ext2(message_ext) # 最终提取出的512位信息
+            print('Extracted message:{}'.format(message_ext))
+            # 与原始信息对比，得出提取准确率
+            message = message.cpu().numpy()
+            message_ext = message_ext.detach().cpu().numpy()
+            m = []
+            m_ext = []
+            for i in message[0]:
+                m.append(0 if i < 0.5 else 1)
+            
+            for j in message_ext[0]:
+                m_ext.append(0 if j < 0.5 else 1)
+
+            print(m, m_ext)
+            len = len(m)
+            count = 0
+            for (i, j) in zip(m, m_ext):
+                if(i == j):
+                    count = count + 1
+            print('Acc:{}'.format(count/len))
+
             output = output.cpu()
 
             output_name = output_dir / '{:s}_stylized_{:s}{:s}'.format(
                 content_path.stem, style_path.stem, args.save_ext)
             save_image(output, str(output_name))
+
+
+

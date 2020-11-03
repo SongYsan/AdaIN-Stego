@@ -85,13 +85,14 @@ log_dir = Path(args.log_dir)
 log_dir.mkdir(exist_ok=True, parents=True)
 writer = SummaryWriter(log_dir=str(log_dir))
 
+extractor = net.extractor
 decoder = net.decoder
 vgg = net.vgg
 
 vgg.load_state_dict(torch.load(args.vgg))
 vgg = nn.Sequential(*list(vgg.children())[:31])
-network = net.Net(vgg, decoder)
-network.train()
+network = net.Net(vgg, decoder, extractor)
+network.train() # 将training参数设置为True
 network.to(device)
 
 content_tf = train_transform()
@@ -109,16 +110,22 @@ style_iter = iter(data.DataLoader(
     sampler=InfiniteSamplerWrapper(style_dataset),
     num_workers=args.n_threads))
 
-optimizer = torch.optim.Adam(network.decoder.parameters(), lr=args.lr)
+optimizer = torch.optim.Adam([
+    {'params': network.decoder.parameters(), 'lr': args.lr},
+    {'params': network.extractor.parameters()}
+])
 
 for i in tqdm(range(args.max_iter)):
     adjust_learning_rate(optimizer, iteration_count=i)
     content_images = next(content_iter).to(device)
     style_images = next(style_iter).to(device)
-    loss_c, loss_s = network(content_images, style_images)
+    message = torch.rand(args.batch_size, 512).to(device)
+    # print(content_images.shape)
+    # print(message.shape)
+    loss_c, loss_s, loss_m = network(content_images, style_images, message)
     loss_c = args.content_weight * loss_c
     loss_s = args.style_weight * loss_s
-    loss = loss_c + loss_s
+    loss = loss_c + loss_s + loss_m
 
     optimizer.zero_grad()
     loss.backward()
@@ -126,6 +133,7 @@ for i in tqdm(range(args.max_iter)):
 
     writer.add_scalar('loss_content', loss_c.item(), i + 1)
     writer.add_scalar('loss_style', loss_s.item(), i + 1)
+    writer.add_scalar('loss_message', loss_m.item(), i + 1)
 
     if (i + 1) % args.save_model_interval == 0 or (i + 1) == args.max_iter:
         state_dict = net.decoder.state_dict()
@@ -133,4 +141,10 @@ for i in tqdm(range(args.max_iter)):
             state_dict[key] = state_dict[key].to(torch.device('cpu'))
         torch.save(state_dict, save_dir /
                    'decoder_iter_{:d}.pth.tar'.format(i + 1))
+
+        state_dict2 = net.extractor.state_dict()
+        for key in state_dict2.keys():
+            state_dict2[key] = state_dict2[key].to(torch.device('cpu'))
+        torch.save(state_dict2, save_dir /
+                   'extractor_iter_{:d}.pth.tar'.format(i + 1))
 writer.close()

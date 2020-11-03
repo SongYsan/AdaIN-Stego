@@ -3,6 +3,65 @@ import torch.nn as nn
 from function import adaptive_instance_normalization as adain
 from function import calc_mean_std
 
+extractor = nn.Sequential(
+    nn.Conv2d(3, 3, (1, 1)),
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(3, 64, (3, 3)),
+    nn.ReLU(),  # relu1-1
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(64, 64, (3, 3)),
+    nn.ReLU(),  # relu1-2
+    nn.MaxPool2d((2, 2), (2, 2), (0, 0), ceil_mode=True),
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(64, 128, (3, 3)),
+    nn.ReLU(),  # relu2-1
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(128, 128, (3, 3)),
+    nn.ReLU(),  # relu2-2
+    nn.MaxPool2d((2, 2), (2, 2), (0, 0), ceil_mode=True),
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(128, 256, (3, 3)),
+    nn.ReLU(),  # relu3-1
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(256, 256, (3, 3)),
+    nn.ReLU(),  # relu3-2
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(256, 256, (3, 3)),
+    nn.ReLU(),  # relu3-3
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(256, 256, (3, 3)),
+    nn.ReLU(),  # relu3-4
+    nn.MaxPool2d((2, 2), (2, 2), (0, 0), ceil_mode=True),
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(256, 512, (3, 3)),
+    nn.ReLU(),  # relu4-1, this is the last layer used
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(512, 512, (3, 3)),
+    nn.ReLU(),  # relu4-2
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(512, 512, (3, 3)),
+    nn.ReLU(),  # relu4-3
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(512, 512, (3, 3)),
+    nn.ReLU(),  # relu4-4
+    nn.MaxPool2d((2, 2), (2, 2), (0, 0), ceil_mode=True),
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(512, 512, (3, 3)),
+    nn.ReLU(),  # relu5-1
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(512, 512, (3, 3)),
+    nn.ReLU(),  # relu5-2
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(512, 512, (3, 3)),
+    nn.ReLU(),  # relu5-3
+    nn.ReflectionPad2d((1, 1, 1, 1)),
+    nn.Conv2d(512, 512, (3, 3)),
+    nn.ReLU(),  # relu5-4
+    
+    nn.Linear(in_features=512*16*16, out_features=512),
+    nn.Tanh()
+)
+
 decoder = nn.Sequential(
     nn.ReflectionPad2d((1, 1, 1, 1)),
     nn.Conv2d(512, 256, (3, 3)),
@@ -93,14 +152,20 @@ vgg = nn.Sequential(
 
 
 class Net(nn.Module):
-    def __init__(self, encoder, decoder):
+    def __init__(self, encoder, decoder, extractor):
         super(Net, self).__init__()
         enc_layers = list(encoder.children())
         self.enc_1 = nn.Sequential(*enc_layers[:4])  # input -> relu1_1
         self.enc_2 = nn.Sequential(*enc_layers[4:11])  # relu1_1 -> relu2_1
         self.enc_3 = nn.Sequential(*enc_layers[11:18])  # relu2_1 -> relu3_1
         self.enc_4 = nn.Sequential(*enc_layers[18:31])  # relu3_1 -> relu4_1
+        
         self.decoder = decoder
+
+        self.extractor = extractor
+        ext_layers = list(self.extractor.children())
+        self.ext_1 = nn.Sequential(*ext_layers[:-2])
+        self.ext_2 = nn.Sequential(*ext_layers[-2:])
         self.mse_loss = nn.MSELoss()
 
         # fix the encoder
@@ -122,6 +187,11 @@ class Net(nn.Module):
             input = getattr(self, 'enc_{:d}'.format(i + 1))(input)
         return input
 
+    def calc_message_loss(self, input, target):
+        # print(input.size(), target.size())
+        assert (input.size() == target.size())
+        return self.mse_loss(input, target)
+
     def calc_content_loss(self, input, target):
         assert (input.size() == target.size())
         assert (target.requires_grad is False)
@@ -135,18 +205,25 @@ class Net(nn.Module):
         return self.mse_loss(input_mean, target_mean) + \
                self.mse_loss(input_std, target_std)
 
-    def forward(self, content, style, alpha=1.0):
+    def forward(self, content, style, message, alpha=1.0):
         assert 0 <= alpha <= 1
         style_feats = self.encode_with_intermediate(style)
         content_feat = self.encode(content)
         t = adain(content_feat, style_feats[-1])
+        # t = embed(t, message)
+        t = t + message.view(-1, 512, 1, 1)
         t = alpha * t + (1 - alpha) * content_feat
 
         g_t = self.decoder(t)
         g_t_feats = self.encode_with_intermediate(g_t)
+        message_ext = self.ext_1(g_t)
+        # print(message_ext.shape)
+        message_ext = message_ext.view(8,512*16*16)
+        message_ext = self.ext_2(message_ext)
 
         loss_c = self.calc_content_loss(g_t_feats[-1], t)
         loss_s = self.calc_style_loss(g_t_feats[0], style_feats[0])
+        loss_m = self.calc_message_loss(message_ext, message)
         for i in range(1, 4):
             loss_s += self.calc_style_loss(g_t_feats[i], style_feats[i])
-        return loss_c, loss_s
+        return loss_c, loss_s, loss_m
